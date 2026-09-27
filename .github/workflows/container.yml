@@ -1,0 +1,112 @@
+name: Build and publish container
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Prepare image metadata
+        id: image
+        shell: bash
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Set image tags
+        id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=long
+            type=semver,pattern={{version}}
+          flavor: latest=false
+
+      - name: Run tests and build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          tags: qwen:verification
+          build-args: |
+            VERSION=${{ steps.image.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify container health, static assets and API
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name qwen-verification --read-only --cap-drop ALL \
+            --security-opt no-new-privileges:true --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            -p 127.0.0.1:18080:3001 qwen:verification
+          trap 'docker logs qwen-verification; docker rm -f qwen-verification' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/api/health > /dev/null; then break; fi
+            sleep 1
+          done
+          node scripts/container-smoke.mjs http://127.0.0.1:18080
+          test "$(docker inspect --format '{{.Config.User}}' qwen-verification)" = "node"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push verified image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.metadata.outputs.tags }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker tag qwen:verification "$tag"
+            docker push "$tag"
+          done <<< "$IMAGE_TAGS"
+
+      - name: Verify published image
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE_NAME:sha-$GITHUB_SHA"
+          {
+            echo '### Published container'
+            echo "Image: \`$IMAGE_NAME:sha-$GITHUB_SHA\`"
+            echo 'Platform: linux/amd64'
+            echo 'Unit tests, production build and container smoke checks passed before publishing.'
+          } >> "$GITHUB_STEP_SUMMARY"

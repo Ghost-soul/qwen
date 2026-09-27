@@ -1,0 +1,17 @@
+.git
+.github
+node_modules
+dist
+artifacts
+coverage
+**/.env
+**/.env.*
+**/*.local
+**/*.log
+**/*.tsbuildinfo
+**/.DS_Store
+**/Thumbs.db
+**/*.pem
+**/*.key
+.vscode
+.idea
